@@ -7,6 +7,9 @@ library(ggplot2)
 library(corrplot)
 library(car)
 library(descr)
+library(stargazer) #Create a ready to use table in LaTeX style
+# https://www.r-bloggers.com/2013/01/stargazer-package-for-beautiful-latex-tables-from-r-statistical-models-output/
+
 
 ########################################
 # EXPLORATORY ANALYSIS & PREPROCESSING
@@ -42,7 +45,9 @@ table(xsell$age)
 table(xsell$xsell)
 barplot(table(xsell$age))
 
-
+# unbalance class check
+print(table(xsell$xsell))
+print(prop.table(table(xsell$xsell))) #prob
 
 
 ###################
@@ -75,7 +80,7 @@ any(is.na(xsell))
 xsell$married <- ifelse(xsell$marital_status=="VH", 1, 0)
 table(xsell$married)
 
-xsell <- subset(xsell, select = -marital_status)
+xsell <- xsell[,-c(6,10,14)]
 
 # create an "overdraft" variable: if the client has used the overdraft within 90 days
 xsell$overdraft <- ifelse(xsell$nr_days_when_giro_below_0 >0, 1, 0)
@@ -87,6 +92,7 @@ aggregate(xsell ~ overdraft, data=xsell, FUN="mean")
 xsell$age_2 <- xsell$age ^ 2
 xsell$age_3 <- xsell$age ^ 3
 
+stargazer(xsell, median = T,table.placement = "H")
 ###################
 # BIVARIATE ANALYSIS 
 ###################
@@ -220,18 +226,12 @@ xsell_random <- xsell[order(runif(100000)),] #sort the data set randomly
 xsell_valid <- xsell_random[1:20000, ]       # 20% / 20000 observations in the validation dataset
 xsell_train <- xsell_random[20001:100000, ]   # 80% / 80000 in the training data set
 
-#############################################
-#               S.M.O.T.E.
-#############################################
-
-
-
 
 #############################################
 #               LOGISTIC REGRESSION
 #############################################
 
-model <- xsell ~ age + logins_mobile + customer_tenure_months +overdraft + vol_eur_inflows + vol_eur_outflows + nr_girocard_trx_90d + prod_mortgages + income + loan_mailing
+model <- xsell ~ age + logins_mobile + customer_tenure_months +overdraft + vol_eur_inflows + vol_eur_outflows + nr_girocard_trx_90d + prod_mortgages + income
 
 logit <- glm(model, data = xsell_train, family="binomial")
 summary(logit)
@@ -506,3 +506,247 @@ roc <- roc(xsell_valid$xsell,xsell_valid$pred_xgb, percent=TRUE, plot=TRUE, prin
 importance_matrix <- xgb.importance(model = xgb)
 print(importance_matrix)
 xgb.plot.importance(importance_matrix, cex=1.2)
+
+
+##################################
+#             UPLIFT
+#################################
+
+# 2) Estimate a model using the training dataset ####
+model <- xsell ~ age + logins_mobile + customer_tenure_months +overdraft + vol_eur_inflows + vol_eur_outflows + nr_girocard_trx_90d
+
+logit <- glm(model, data = xsell_train, family="binomial")
+summary(logit)
+
+# Prediction on the validation dataset
+xsell_valid$pred_logit  <- predict(logit,newdata=xsell_valid, type="response")
+
+
+# Recode the prediction into a binary variable
+xsell_valid$predict <- ifelse(xsell_valid$pred_logit >.1,1,0)
+
+table(xsell_valid$xsell, xsell_valid$predict)
+
+
+# Lift and Gain Charts #################################################################
+
+# Calculate deciles using the predicted xsell probability with package "Stat Measures"
+install.packages("StatMeasures")
+library(StatMeasures)
+library(remotes)
+install_version("StatMeasures", "1.0")
+
+
+###########################
+# function decile
+##########################
+
+decile <- function(vector, decreasing = FALSE) {
+  if(class(vector) != 'integer' && class(vector) != 'numeric') {
+    stop('Invalid input: vector should be either integer or numeric')    
+  } else if (class(decreasing) != 'logical' | length(decreasing) != 1) {
+    stop('Invalid input: decreasing should be a logical vector of length 1')
+  } else {
+    decile <- as.integer(as.character(cut(vector, 
+                                          breaks = quantile(vector, probs = seq(0, 1, by = 0.1), na.rm = TRUE), 
+                                          labels = if(decreasing == FALSE) {1:10} else {10:1}, 
+                                          include.lowest = TRUE)))
+    return(decile)
+  }
+}
+
+# -------------------
+
+xsell_valid$decile <-decile(vector=xsell_valid$pred_logit)
+table(xsell_valid$decile)
+
+# Calculate mean by deciles
+
+detach(ModelMetrics:data.table)
+install.packages("data.table", version = "1.14.8")
+library(data.table) # take your time to learn how to use data.table, it makes your like a lot easier in many situations! 
+detach("package:ModelMetrics", unload = TRUE)
+
+xsell_valid<-data.table(xsell_valid)
+xsell_valid[,lapply(.SD,mean),by=decile, .SDcols=c("pred_logit","xsell")]
+
+# Check the sum and mean of xsell in the top deciles
+sum(xsell_valid$xsell) #number of xsellers in the validation dataset 
+t1 <- subset(xsell_valid,decile>=8) # Get the only the customers of the top-3 deciles (8, 9 and 10)
+mean(t1$xsell) #number of xsellers in the top-3-deciles
+
+# Plot deciles (Lift chart)
+library(ggplot2)
+theme_set(theme_grey(base_size = 12)) # adjust font size
+ggplot(xsell_valid[,.(mean_xsell=mean(xsell)),by=decile], #dataset to plot: calculates mean xsell per decile
+       aes(x=decile, fill=I("darkblue"), y=mean_xsell)) + ylab("Average (True) xsell Probability") +
+  xlab("Deciles by Predicted xsell Probability") + geom_bar(stat = "identity") + 
+  scale_y_continuous(limits=c(0,0.3),labels = scales::percent) +
+  scale_x_continuous(breaks=seq(1:10)) #+geom_smooth(method = "lm", colour = "darkcyan", size=1.2, aes(fill=I("gray22")))
+
+
+
+# Gain chart
+#install.packages("gains")
+library(gains)
+gains(xsell_valid$xsell,xsell_valid$pred_logit)
+par(lwd=2, ps=12) # line thickness
+plot(gains(xsell_valid$xsell,xsell_valid$pred_logit),
+     xlab="Deciles",ylab="Mean xsell",
+     legend=c("Mean xsell","Cumul. Mean xsell","Mean Predicted xsell"))
+
+#check the "loan_mailing" variable
+
+table(xsell$loan_mailing)
+table(xsell$loan_mailing, xsell$xsell)
+
+mean(xsell$xsell[xsell$loan_mailing==0])
+mean(xsell$xsell[xsell$loan_mailing==1])
+
+#### Graphs ####
+
+### Dataset with average Pr(Response) by age
+library(data.table)
+pred_means <- NULL
+pred_means<-data.table(xsell)[,.(avg_xsell_tr=mean(xsell[loan_mailing==1]),avg_xsell_ctl=mean(xsell[loan_mailing==0])),by=age] 
+pred_means$uplift<-pred_means$avg_xsell_tr-pred_means$avg_xsell_ctl
+
+library(ggplot2)
+
+theme_set(theme_grey(base_size = 12))
+ggplot(pred_means[age<=60], aes(age)) + 
+  geom_point(aes(y = avg_xsell_tr, colour = "avg_xsell_tr"), lwd=1.2)+ 
+  geom_point(aes(y = avg_xsell_ctl, colour = "avg_xsell_ctl"), lwd=1.2) + 
+  # geom_line(data=pred_means, aes(y=avg_nogiro, x=age, color = "avg_nomail")) +
+  # geom_line(data=pred_means, aes(y=avg_giro, x=age, color = "avg_v1_mail")) +
+  #geom_smooth(data=pred_means, aes(y=avg_nomail, x=logins_mobile, color = "avg_nomail"), method = "glm", 
+  #            method.args = list(family = "binomial"), se=FALSE) +
+  #geom_smooth(data=pred_means, aes(y=avg_mail, x=logins_mobile, color = "avg_mail"), method = "glm", 
+  #            method.args = list(family = "binomial"), se=FALSE) +
+  labs(title = "", x = "Age", y = "Pr(Response)") + 
+  scale_color_manual(name="Model",
+                     values=c(avg_xsell_tr="red",avg_xsell_ctl="blue"))
+
+
+
+qplot(pred_means$age, pred_means$uplift,xlab="Age", ylab="Mean-Uplift Pr(Response)")  +
+  geom_line(data = pred_means, aes(x=age, y=uplift, color="uplift"), show.legend=FALSE) + 
+  geom_point(color='blue', show.legend=FALSE) +
+  scale_color_manual(name="Model",
+                     values=c(uplift="blue"))
+
+##################### Uplift Random Forest ######################################
+install.packages("githubinstall")
+library(githubinstall)
+githubinstall("uplift")
+
+
+
+library(devtools)
+install_github("https://github.com/cran/uplift/tree/master")
+library(uplift)
+
+
+# Important: upliftRF doesn't support factor variables - need to transform to numeric / dummies
+# Important: upliftRF throws an error if the variables in the dataset have labels 
+
+
+# add "+trt(giro_mailing)" to the model
+model_upl <- xsell ~ age + logins_mobile + customer_tenure_months +overdraft + vol_eur_inflows + vol_eur_outflows + nr_girocard_trx_90d + trt(loan_mailing)
+
+
+# Check balance of predictors between Treatment and Control (conditional independence of treatment and covariates)
+# P-values are two-sided tests for H0 "no difference"
+# We see many low p-values here, what do they tell you?
+
+checkBalance(model_upl,data = xsell_train, report = "all")
+
+# Details of the model: compute the average value of the response variable for each predictor by treatment indicator
+explore(model_upl, data = xsell_train)
+
+
+# Net Information Value and Weight of Evidence
+niv.1 <- niv(model_upl,data = xsell_train, plotit = TRUE)
+niv.1$niv
+niv.1$nwoe
+
+
+### Random Forest Uplift Model ####
+
+upl1 <- upliftRF(model_upl,
+                 data = xsell_train,
+                 split_method = "Chisq",
+                 ntree=200,
+                 mtry=5)
+
+summary(upl1)
+varImportance(upl1, plotit=TRUE, normalize=FALSE)
+
+
+# Predictions on validation dataset, Note that thereare two predictions; with/without treatment
+pred_upl <- NULL
+pred_upl <- as.data.frame(predict(upl1, xsell_valid, predict.all=FALSE))
+# rename the prediction variables
+colnames(pred_upl)<-c("pred_upl_mail","pred_upl_nomail")
+xsell_valid <- cbind(xsell_valid, pred_upl)
+
+# Calculate uplift
+xsell_valid$pred_upl_net <- xsell_valid$pred_upl_mail - xsell_valid$pred_upl_nomail
+mean(xsell_valid$pred_upl_net)
+mean(xsell_valid$pred_upl_mail)
+mean(xsell_valid$pred_upl_nomail)
+
+
+# Check the performance in 10 segments 
+perf_upl1_valid<-performance(xsell_valid$pred_upl_mail, xsell_valid$pred_upl_nomail, xsell_valid$xsell, xsell_valid$loan_mailing, direction=1, groups=10)
+perf_upl1_valid
+
+
+
+
+
+#### Graphs Uplift Model ####
+
+### Dataset with average Pr(Response) by age
+library(data.table)
+pred_means <- NULL #clean old version
+pred_means<-data.table(xsell_valid)[,.(avg_nomail=mean(pred_upl_nomail),avg_mail=mean(pred_upl_mail)),by=age] 
+
+
+# Net response probabilities 
+pred_means$uplift<-pred_means$avg_mail-pred_means$avg_nomail
+
+# See differences graphically 
+
+library(ggplot2)
+
+
+theme_set(theme_grey(base_size = 12))
+ggplot(pred_means, aes(age)) + 
+  geom_point(aes(y = avg_nomail, colour = "avg_nomail"), lwd=1.2)+ 
+  geom_point(aes(y = avg_mail, colour = "avg_mail"), lwd=1.2) + 
+  geom_line(data=pred_means, aes(y=avg_nomail, x=age, color = "avg_nomail")) +
+  geom_line(data=pred_means, aes(y=avg_mail, x=age, color = "avg_mail")) +
+  #geom_smooth(data=pred_means, aes(y=avg_nomail, x=age, color = "avg_nomail"), method = "glm", 
+  #            method.args = list(family = "binomial"), se=FALSE) +
+  #geom_smooth(data=pred_means, aes(y=avg_mail, x=age, color = "avg_mail"), method = "glm", 
+  #            method.args = list(family = "binomial"), se=FALSE) +
+  labs(title = "", x = "Age", y = "Pr(Response)") + 
+  scale_color_manual(name="Model",
+                     values=c(avg_nomail="red",avg_mail="blue"))
+
+
+qplot(pred_means$age, pred_means$uplift,xlab="Age", ylab="Mean-Uplift Pr(Response)")  +
+  geom_line(data = pred_means, aes(x=age, y=uplift, color="uplift"), show.legend=FALSE) + 
+  geom_point(color='blue', show.legend=FALSE) +
+  scale_color_manual(name="Model",
+                     values=c(uplift="blue"))
+
+
+
+
+
+
+
+
+
